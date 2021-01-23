@@ -1,0 +1,155 @@
+#!/bin/bash
+declare -A BUCKETS_DICT
+declare -A BUCKETS_REGION
+BASE_REGION=('ca-central-1' 'us-east-1' 'us-east-2' 'us-west-2')
+BASE_OBJECT_NAME="objects-folder"
+BASE_BUCKET_NAME="test-bucket-solal-nbr"
+BASE_TERRAFORM_FOLDER="terraform"
+MIN_FILE_RANGE=1
+MAX_FILE_RANGE=1100
+# Max file size set to 1.1Mo
+MAX_FILE_SIZE=1153433
+TEST_BASE_DIR=$(readlink -f $(dirname $0))
+
+verify_number_provided() {
+    NUMBER_OF_FILES=$1
+    if [[ -z $NUMBER_OF_FILES ]]; then
+	echo "Please provide a number of object to create. (Between 1 and 1100)"
+	exit 1
+    else
+	if [[ $NUMBER_OF_FILES -gt $MAX_FILE_RANGE || $NUMBER_OF_FILES -lt $MIN_FILE_RANGE ]]; then
+	    echo "Incorrect number provided. (Must be between 1 and 1100)"
+	    exit 1
+	fi
+    fi
+}
+
+generate_files() {
+    OBJECTS_DIR="${TEST_BASE_DIR}/${BASE_OBJECT_NAME}-$1"
+    NUMBER_OF_FILE=$2
+    echo "Generating $NUMBER_OF_FILES test files in $OBJECTS_DIR..."
+    mkdir -p $OBJECTS_DIR
+    for file in $(seq 1 $NUMBER_OF_FILES); do
+	head -c $((1 + $RANDOM % $MAX_FILE_SIZE)) < /dev/urandom > "$OBJECTS_DIR/test$file"
+    done
+    echo "Done"
+
+    BUCKET_NAME="${BASE_BUCKET_NAME}-$1"
+    BUCKETS_DICT+=([${BUCKET_NAME}]=${OBJECTS_DIR})
+}
+
+build() {
+    BUCKET_NAME=$1
+    OBJECT_NAME=$2
+    REGION_NUMBER=${#BASE_REGION[@]}
+    RANDOM_REGION=$(( $RANDOM % $REGION_NUMBER ))
+    FINAL_REGION=${BASE_REGION[$RANDOM_REGION]}
+    BUCKETS_REGION+=([${FINAL_REGION}]=${BUCKET_NAME})
+
+    cd $BASE_TERRAFORM_FOLDER
+    echo -e "\nEXECUTE TERRAFORM APPLY $FINAL_REGION $BUCKET_NAME\n"
+    terraform apply -auto-approve -var region_name="$FINAL_REGION" -var bucket_name="$BUCKET_NAME"
+
+    echo -e "\nCREATE S3 OBJECTS VIA PARS3\n"
+    cd ..
+    pars3 load --bucket $BUCKET_NAME --object $OBJECT_NAME
+    echo -e "\nDone\n"
+}
+
+filtered_tests() {
+    REGION_NAME=$1
+    BUCKET_NAME=$2
+
+    echo -e "\nRUN PARS3 FILTERED TESTS\n"
+    pars3 bucket --region $REGION_NAME
+    pars3 bucket --name $BUCKET_NAME
+    pars3 cost --region $REGION_NAME
+}
+
+base_tests() {
+    echo -e "\nRUN PARS3 BASE TESTS\n"
+    pars3 bucket
+    pars3 bucket --size Mb
+    pars3 bucket --storage STANDARD
+    pars3 cost
+    pars3 cost --days 5
+}
+
+clean() {
+    #echo -e "\n CLEAN BUCKET CREATED\n"
+    #cd $BASE_TERRAFORM_FOLDER
+    #for region in ${!BUCKETS_REGION[@]}; do
+    #    terraform destroy -auto-approve -var region_name="$region" -var bucket_name="$BUCKETS_REGION[$bucket]"
+    #done
+
+    echo -e "\nCLEAN LOCAL OBJECTS FOLDER\n"
+    cd ..
+    for bucket in ${!BUCKETS_DICT[@]}; do
+	rm -rf ${BUCKETS_DICT[$bucket]}
+    done
+}
+
+case $1 in
+    "--bucket-number")
+	if [[ "$#" -lt 2 ]]; then
+	    echo "Please provide a number of bucket"
+	    exit 1
+	else
+	    if [[ $# -eq 2 ]]; then
+		echo "Please provide the --files-number option"
+		exit 1
+            else
+                case $3 in
+                    "--files-number")
+		        bucket_nbr_provided=$2
+		        number_of_args_expected=$(( 3 + bucket_nbr_provided ))
+		        if [[ "$#" -ne $number_of_args_expected ]]; then
+		            echo "Please provide number of files for each bucket provided"
+		            exit 1
+		        else
+                            echo -e "GENERATE LOAD\n"
+                            # Create object folder based on n bucket provided + add n files provided in it
+                            for bucket_number in $(seq 1 $bucket_nbr_provided); do
+                                # Retrieve number of files per bucket provided by the user
+                                declare number_of_files=$(( 3 + bucket_number ))
+                                verify_number_provided ${!number_of_files}
+                                generate_files $bucket_number ${!number_of_files}
+                            done
+
+
+                            cd $BASE_TERRAFORM_FOLDER
+                            echo -e "\nEXECUTE TERRAFORM INIT\n"
+                            terraform init
+			    cd ..
+
+                            #From here we have the bucket and object folder name
+                            for bucket in ${!BUCKETS_DICT[@]}; do
+                                build $bucket "${BUCKETS_DICT[$bucket]}"
+                            done
+
+                            for region in ${!BUCKETS_REGION[@]}; do
+                                filtered_tests $region ${BUCKETS_REGION[$region]}
+                            done
+
+                            base_tests
+                            clean
+                        fi
+                        ;;
+		    *)
+		        echo "Illegal option provided"
+		        exit 1
+		        ;;
+	        esac
+	    fi
+        fi
+        ;;
+    *)
+        echo -e "Usage \n"
+        echo -e "\ttest --bucket-number N --files-number X Y"
+        echo -e "\nExamples\n"
+        echo -e "\ttest --bucket-number 1 --files-number 10"
+        echo -e "\ttest --bucket-number 2 --files-number 10 100"
+        echo -e "\ttest --bucket-number 3 --files-number 10 100 1000\n"
+        exit 0
+        ;;
+esac
